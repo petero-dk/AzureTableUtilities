@@ -1,28 +1,18 @@
-﻿using System;
+﻿using Azure;
+using Azure.Data.Tables;
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Configuration;
-using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
-using System.Security;
-using System.Net.Http;
-
-using AZStorage = Microsoft.Azure.Storage;
-using Microsoft.Azure.Storage.Auth;
-using AZBlob = Microsoft.Azure.Storage.Blob;
-using Microsoft.Azure.Storage.Core;
-using Microsoft.Azure.Storage.File;
+using System.Linq;
+using System.Text;
+using TheByteStuff.AzureTableUtilities.Exceptions;
+//using AZBlob = Microsoft.Azure.Storage.Blob;
 
 using AzureTables = Azure.Data.Tables;
-using Azure.Data.Tables.Models;
-using Azure;
-
-using Newtonsoft.Json;
-
-using TheByteStuff.AzureTableUtilities.Exceptions;
 
 namespace TheByteStuff.AzureTableUtilities
 {
@@ -31,10 +21,9 @@ namespace TheByteStuff.AzureTableUtilities
     /// </summary>
     public class BackupAzureTables
     {
-        //private SecureString AzureTableConnectionSpec = new SecureString();
-        //private SecureString AzureBlobConnectionSpec = new SecureString();
-        private string AzureTableConnectionSpec = "";
-        private string AzureBlobConnectionSpec = "";
+        private TableServiceClient tableServiceClient;
+        private BlobServiceClient blobServiceClient;
+
 
         /// <summary>
         /// Constructor, sets same connection spec for both the Azure Tables as well as the Azure Blob storage.
@@ -42,19 +31,21 @@ namespace TheByteStuff.AzureTableUtilities
         /// <param name="AzureConnection">Connection string for Azure Table and Blob Connections; ex "AccountName=devstoreaccount1;AccountKey={xxxxxxxxxxx};DefaultEndpointsProtocol=http;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;" </param>
         public BackupAzureTables(string AzureConnection) : this(AzureConnection, AzureConnection)
         {
-            
+            tableServiceClient = new TableServiceClient(AzureConnection);
+            blobServiceClient = new BlobServiceClient(AzureConnection);
         }
 
         /// <summary>
-        /// Constructor, accepts SecureString and sets same connection spec for both the Azure Tables as well as the Azure Blob storage.
+        /// Directly set the Service Clients
         /// </summary>
-        /// <param name="AzureConnection">Connection string for Azure Table and Blob Connections</param>
-        /*
-        public BackupAzureTables(SecureString AzureConnection) : this(AzureConnection, AzureConnection)
+        /// <param name="tableServiceClient"></param>
+        /// <param name="blobServiceClient"></param>
+        public BackupAzureTables(TableServiceClient tableServiceClient, BlobServiceClient blobServiceClient)
         {
-
+            this.tableServiceClient = tableServiceClient;
+            this.blobServiceClient = blobServiceClient;
         }
-        */
+
 
         /// <summary>
         /// Constructor, allows a different connection spec for Azure Table and Azure Blob storage.
@@ -68,18 +59,8 @@ namespace TheByteStuff.AzureTableUtilities
                 throw new ConnectionException(String.Format("Connection spec must be specified."));
             }
 
-            AzureTableConnectionSpec = AzureTableConnection;
-            AzureBlobConnectionSpec = AzureBlobConnection;
-            /*
-            foreach (char c in AzureTableConnection.ToCharArray())
-            {
-                AzureTableConnectionSpec.AppendChar(c);
-            }
-            foreach (char c in AzureBlobConnection.ToCharArray())
-            {
-                AzureBlobConnectionSpec.AppendChar(c);
-            }
-            */
+            tableServiceClient = new TableServiceClient(AzureTableConnection);
+            blobServiceClient = new BlobServiceClient(AzureBlobConnection);
         }
 
 
@@ -115,9 +96,8 @@ namespace TheByteStuff.AzureTableUtilities
         /// <returns>A string indicating the name of the blob file created as well as a count of how many files were aged.</returns>
         public string BackupTableToBlob(string TableName, string BlobRoot, string OutFileDirectory, bool Compress = false, bool Validate = false, int RetentionDays = 30, int TimeoutSeconds = 30, List<Filter> filters = default(List<Filter>))
         {
-            string OutFileName = "";
+            string OutFileName ;
             string OutFileNamePath = "";
-            int BackupsAged = 0;
 
             if (String.IsNullOrWhiteSpace(TableName))
             {
@@ -144,42 +124,27 @@ namespace TheByteStuff.AzureTableUtilities
                 OutFileName = this.BackupTableToFile(TableName, OutFileDirectory, Compress, Validate, TimeoutSeconds, filters); 
                 OutFileNamePath = Path.Combine(OutFileDirectory, OutFileName);
 
-                if (!AZStorage.CloudStorageAccount.TryParse(new System.Net.NetworkCredential("", AzureBlobConnectionSpec).Password, out AZStorage.CloudStorageAccount StorageAccountAZ))
-                {
-                    throw new ConnectionException("Can not connect to CloudStorage Account.  Verify connection string.");
-                }
 
-                AZBlob.CloudBlobClient ClientBlob = AZBlob.BlobAccountExtensions.CreateCloudBlobClient(StorageAccountAZ);
-                var container = ClientBlob.GetContainerReference(BlobRoot);
+                var container = blobServiceClient.GetBlobContainerClient(BlobRoot);
+
                 container.CreateIfNotExists();
-                AZBlob.CloudBlobDirectory directory = container.GetDirectoryReference(BlobRoot.ToLower() + "-table-" + TableName.ToLower());
+                var directory = container.GetBlobClient(BlobRoot.ToLower() + "-table-" + TableName.ToLower() + "/" + OutFileName);
 
-                AZBlob.CloudBlockBlob BlobBlock = directory.GetBlockBlobReference(OutFileName);
-                BlobBlock.StreamWriteSizeInBytes = 1024 * 1024 * 32; //Set stream write size to 32MB
-                BlobBlock.UploadFromFile(OutFileNamePath);                                
+                var blobClient = container.GetBlobClient(OutFileName);
+                var blobUploadOptions = new BlobUploadOptions
+                {
+                    TransferOptions = new StorageTransferOptions
+                    {
+                        MaximumTransferSize = 1024 * 1024 * 32 // Set stream write size to 32MB
+                    }
+                };
+                blobClient.Upload(OutFileNamePath, blobUploadOptions);
 
                 DateTimeOffset OffsetTimeNow = System.DateTimeOffset.Now;
                 DateTimeOffset OffsetTimeRetain = System.DateTimeOffset.Now.AddDays(-1 * RetentionDays);
 
-                //Cleanup old versions
-                var BlobList = directory.ListBlobs().OfType<AZBlob.CloudBlockBlob>().ToList(); ;
-                foreach (var blob in BlobList)
-                {
-                    if (blob.Properties.Created < OffsetTimeRetain)
-                    {
-                        try
-                        {
-                            blob.Delete();
-                            BackupsAged++;
-                        }
-                        catch (Exception ex)
-                        {
-                            throw new AgingException(String.Format("Error aging file '{0}'.", blob.Name), ex);
-                        }
-                    }
-                }
 
-                return String.Format("Table '{0}' backed up as '{2}' under blob '{3}\\{4}'; {1} files aged.", TableName, BackupsAged, OutFileName, BlobRoot , directory.ToString());
+                return String.Format("Table '{0}' backed up as '{1}' under blob '{2}\\{3}';", TableName, OutFileName, BlobRoot , directory.ToString());
             }
             catch (ConnectionException cex)
             {
@@ -263,13 +228,11 @@ namespace TheByteStuff.AzureTableUtilities
 
                 TableSpec TableSpecStart = new TableSpec(TableName);
 
-                AzureTables.TableServiceClient clientSource = new AzureTables.TableServiceClient(AzureTableConnectionSpec.ToString());
-
-                Pageable<AzureTables.TableEntity> queryResultsFilter = clientSource.GetTableClient(TableName).Query<AzureTables.TableEntity>(filter: Filter.BuildFilterSpec(filters), maxPerPage: 100);
+                Pageable<AzureTables.TableEntity> queryResultsFilter = tableServiceClient.GetTableClient(TableName).Query<AzureTables.TableEntity>(filter: Filter.BuildFilterSpec(filters), maxPerPage: 100);
 
                 using (StreamWriter OutFile = new StreamWriter(OutFileNamePath))
                 {
-                    OutFile.WriteLine(JsonConvert.SerializeObject(TableSpecStart));
+                    OutFile.WriteLine(System.Text.Json.JsonSerializer.Serialize(TableSpecStart));
 
                     foreach (Page<AzureTables.TableEntity> page in queryResultsFilter.AsPages())
                     {
@@ -286,7 +249,7 @@ namespace TheByteStuff.AzureTableUtilities
                     }
 
                     TableSpec TableSpecEnd = new TableSpec(TableName, RecordCount);
-                    OutFile.WriteLine(JsonConvert.SerializeObject(TableSpecEnd));
+                    OutFile.WriteLine(System.Text.Json.JsonSerializer.Serialize(TableSpecEnd));
 
                     OutFile.Flush();
                     OutFile.Close();
@@ -316,7 +279,8 @@ namespace TheByteStuff.AzureTableUtilities
                         } while (DetailRec != null);
                         InFile.Close();
 
-                        TableSpec footer= JsonConvert.DeserializeObject<TableSpec>(FooterRec);
+                        TableSpec footer = System.Text.Json.JsonSerializer.Deserialize<TableSpec>(FooterRec);
+
                         if ((footer.RecordCount==InRecords) && (footer.TableName.Equals(TableName)))
                         {
                             //Do nothing, in count=out count
@@ -412,36 +376,35 @@ namespace TheByteStuff.AzureTableUtilities
                     OutFileName = String.Format(TableName + "_Backup_" + System.DateTime.Now.ToString("yyyyMMddHHmmss") + ".txt");
                 }
 
-                if (!AZStorage.CloudStorageAccount.TryParse(new System.Net.NetworkCredential("", AzureBlobConnectionSpec).Password, out AZStorage.CloudStorageAccount StorageAccountAZ))
-                {
-                    throw new ConnectionException("Can not connect to CloudStorage Account.  Verify connection string.");
-                }
-
-                AZBlob.CloudBlobClient ClientBlob = AZBlob.BlobAccountExtensions.CreateCloudBlobClient(StorageAccountAZ);
-                var container = ClientBlob.GetContainerReference(BlobRoot);
+                var container = blobServiceClient.GetBlobContainerClient(BlobRoot);
                 container.CreateIfNotExists();
-                AZBlob.CloudBlobDirectory directory = container.GetDirectoryReference(BlobRoot.ToLower() + "-table-" + TableName.ToLower());
+                var directory = container.GetBlobClient(BlobRoot.ToLower() + "-table-" + TableName.ToLower() + "/" + OutFileName);
 
-                AZBlob.CloudBlockBlob BlobBlock = directory.GetBlockBlobReference(OutFileName);
-                BlobBlock.StreamWriteSizeInBytes = 1024 * 1024 * 32; //Set stream write size to 32MB
+                var blobClient = container.GetBlobClient(OutFileName);
+                var blobUploadOptions = new BlobUploadOptions
+                {
+                    TransferOptions = new StorageTransferOptions
+                    {
+                        MaximumTransferSize = 1024 * 1024 * 32 // Set stream write size to 32MB
+                    }
+                };
 
                 // start upload from stream, iterate through table, possible inline compress
                 try
                 {
-                    AzureTables.TableServiceClient clientSource = new AzureTables.TableServiceClient(AzureTableConnectionSpec.ToString());
 
                     //TODO  Timeout set?
                     //table.ServiceClient.DefaultRequestOptions.ServerTimeout = new TimeSpan(0, 0, TimeoutSeconds);
 
                     var entitiesSerialized = new List<string>();
-                    DynamicTableEntityJsonSerializer serializer = new DynamicTableEntityJsonSerializer();
+                    var serializer = new DynamicTableEntityJsonSerializer();
 
-                    TableSpec TableSpecStart = new TableSpec(TableName);
+                    var TableSpecStart = new TableSpec(TableName);
                     var NewLineAsBytes = Encoding.UTF8.GetBytes("\n");
 
-                    var tempTableSpecStart = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(TableSpecStart));
-                    AZBlob.CloudBlobStream bs2 = BlobBlock.OpenWrite();
-                    Stream bs = BlobBlock.OpenWrite();
+                    var tempTableSpecStart = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(TableSpecStart));
+                    var bs2 = blobClient.OpenWrite(true);
+                    Stream bs = bs2;
 
                     if (Compress)
                     {
@@ -457,7 +420,7 @@ namespace TheByteStuff.AzureTableUtilities
                     bs.Write(NewLineAsBytes, 0, NewLineAsBytes.Length);
                     bs.Flush();
 
-                    Pageable<AzureTables.TableEntity> queryResultsFilter = clientSource.GetTableClient(TableName).Query<AzureTables.TableEntity>(filter: Filter.BuildFilterSpec(filters), maxPerPage: 100);
+                    Pageable<AzureTables.TableEntity> queryResultsFilter = tableServiceClient.GetTableClient(TableName).Query<AzureTables.TableEntity>(filter: Filter.BuildFilterSpec(filters), maxPerPage: 100);
                     foreach (Page<AzureTables.TableEntity> page in queryResultsFilter.AsPages())
                     {
                         foreach (AzureTables.TableEntity qEntity in page.Values)
@@ -472,7 +435,7 @@ namespace TheByteStuff.AzureTableUtilities
                         }
                      }
                     TableSpec TableSpecEnd = new TableSpec(TableName, RecordCount);
-                    var tempTableSpecEnd = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(TableSpecEnd));
+                    var tempTableSpecEnd = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(TableSpecEnd));
                     bs.Write(tempTableSpecEnd, 0, tempTableSpecEnd.Length);
                     bs.Flush();
                     bs.Write(NewLineAsBytes, 0, NewLineAsBytes.Length);
@@ -487,23 +450,6 @@ namespace TheByteStuff.AzureTableUtilities
                 DateTimeOffset OffsetTimeNow = System.DateTimeOffset.Now;
                 DateTimeOffset OffsetTimeRetain = System.DateTimeOffset.Now.AddDays(-1 * RetentionDays);
 
-                //Cleanup old versions
-                var BlobList = directory.ListBlobs().OfType<AZBlob.CloudBlockBlob>().ToList(); ;
-                foreach (var blob in BlobList)
-                {
-                    if (blob.Properties.Created < OffsetTimeRetain)
-                    {
-                        try
-                        {
-                            blob.Delete();
-                            BackupsAged++;
-                        }
-                        catch (Exception ex)
-                        {
-                            throw new AgingException(String.Format("Error aging file '{0}'.", blob.Name), ex);
-                        }
-                    }
-                }
 
                 return String.Format("Table '{0}' backed up as '{2}' under blob '{3}\\{4}'; {1} files aged.", TableName, BackupsAged, OutFileName, BlobRoot, directory.ToString());
             }
@@ -540,7 +486,7 @@ namespace TheByteStuff.AzureTableUtilities
             try
             {
                 StringBuilder BackupResults = new StringBuilder();
-                List<string> TableNames = Helper.GetTableNames(AzureTableConnectionSpec);
+                List<string> TableNames = Helper.GetTableNames(tableServiceClient);
                 if (TableNames.Count() > 0)
                 {
                     foreach (string TableName in TableNames)
