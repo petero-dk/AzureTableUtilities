@@ -2,10 +2,14 @@
 using Azure.Data.Tables;
 using Azure.Data.Tables.Models;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
+using System.Text;
 using TheByteStuff.AzureTableUtilities.Exceptions;
 
 namespace TheByteStuff.AzureTableUtilities
@@ -319,13 +323,14 @@ namespace TheByteStuff.AzureTableUtilities
                             Response<IReadOnlyList<Response>> response = tableServiceClient.GetTableClient(DestinationTableName).SubmitTransaction(Batch);
                             PartitionKey = String.Empty;
                         }
-                        catch (Exception ex) {
+                        catch (Exception ex)
+                        {
                             throw new RestoreFailedException(String.Format("Table '{0}' restore failed.", DestinationTableName), ex);
                         }
                     }
                 } // using (StreamReader
 
-                if (null==footer)
+                if (null == footer)
                 {
                     throw new RestoreFailedException(String.Format("Table '{0}' restore failed, no footer record found.", DestinationTableName));
                 }
@@ -429,31 +434,31 @@ namespace TheByteStuff.AzureTableUtilities
 
             try
             {
-                
-                    BlobContainerClient container = blobServiceClient.GetBlobContainerClient(BlobRoot);
-                    container.CreateIfNotExists();
-                    BlobClient blobClient = container.GetBlobClient($"{BlobRoot.ToLower()}-table-{OriginalTableName.ToLower()}/{BlobFileName}");
 
-                    // If file is compressed, Decompress to a temp file in the blob
-                    if (Decompress)
+                BlobContainerClient container = blobServiceClient.GetBlobContainerClient(BlobRoot);
+                container.CreateIfNotExists();
+                BlobClient blobClient = container.GetBlobClient($"{BlobRoot.ToLower()}-table-{OriginalTableName.ToLower()}/{BlobFileName}");
+
+                // If file is compressed, Decompress to a temp file in the blob
+                if (Decompress)
+                {
+                    BlobClient blobClientTemp = container.GetBlobClient($"{BlobRoot.ToLower()}-table-{OriginalTableName.ToLower()}/{TempFileName}");
+                    BlobClient blobClientRead = container.GetBlobClient($"{BlobRoot.ToLower()}-table-{OriginalTableName.ToLower()}/{BlobFileName}");
+
+                    using (var decompressedStream = blobClientTemp.OpenWrite(true))
                     {
-                        BlobClient blobClientTemp = container.GetBlobClient($"{BlobRoot.ToLower()}-table-{OriginalTableName.ToLower()}/{TempFileName}");
-                        BlobClient blobClientRead = container.GetBlobClient($"{BlobRoot.ToLower()}-table-{OriginalTableName.ToLower()}/{BlobFileName}");
-
-                        using (var decompressedStream = blobClientTemp.OpenWrite(true))
+                        using (var readStream = blobClientRead.OpenRead())
                         {
-                            using (var readStream = blobClientRead.OpenRead())
+                            using (var zip = new GZipStream(readStream, CompressionMode.Decompress, true))
                             {
-                                using (var zip = new GZipStream(readStream, CompressionMode.Decompress, true))
-                                {
-                                    zip.CopyTo(decompressedStream);
-                                }
+                                zip.CopyTo(decompressedStream);
                             }
                         }
-                        BlobFileName = TempFileName;
                     }
+                    BlobFileName = TempFileName;
+                }
 
-                    blobClient = container.GetBlobClient($"{BlobRoot.ToLower()}-table-{OriginalTableName.ToLower()}/{BlobFileName}");
+                blobClient = container.GetBlobClient($"{BlobRoot.ToLower()}-table-{OriginalTableName.ToLower()}/{BlobFileName}");
 
 
                 TableItem TableDest = tableServiceClient.CreateTableIfNotExists(DestinationTableName);
@@ -598,6 +603,54 @@ namespace TheByteStuff.AzureTableUtilities
             }
 
             return String.Format("Restore to table '{0}' Successful; {1} entries.", DestinationTableName, TotalRecordCount);
+        }
+
+        public string RestoreAllTablesFromBlob(string blobRoot, string folder)
+        {
+            var container = blobServiceClient.GetBlobContainerClient(blobRoot);
+            if (!container.Exists())
+                throw new RestoreFailedException(String.Format("Blob container '{0}' does not exist.", blobRoot));
+
+            var restoreResults = new StringBuilder();
+            foreach (BlobHierarchyItem blobItem in container.GetBlobsByHierarchy(prefix: folder, delimiter: "/"))
+            {
+                if (blobItem.IsBlob)
+                {
+                    var tableName = blobItem.Blob.Name.Split('.').First();
+                    var decompress = blobItem.Blob.Name.EndsWith(".7z");
+                    var tempFileName = String.Format("{0}.temp", blobItem.Blob.Name);
+
+                    var blobClient = container.GetBlobClient(blobItem.Blob.Name);
+
+                    // If file is compressed, Decompress to a temp file in the blob
+                    if (decompress)
+                    {
+                        var blobClientTemp = container.GetBlobClient(tempFileName);
+
+                        using (var decompressedStream = blobClientTemp.OpenWrite(true))
+                        using (var readStream = blobClient.OpenRead())
+                        using (var zip = new GZipStream(readStream, CompressionMode.Decompress, true))
+                        {
+                            zip.CopyTo(decompressedStream);
+                        }
+                        blobClient = container.GetBlobClient(tempFileName);
+                    }
+
+                    var TableDest = tableServiceClient.CreateTableIfNotExists(tableName);
+
+                    using (Stream blobStream = blobClient.OpenRead())
+                    using (StreamReader inputFileStream = new StreamReader(blobStream))
+                    {
+                        restoreResults.AppendLine(RestoreFromStream(inputFileStream, tableServiceClient, tableName));
+                        if (decompress)
+                        {
+                            var blobClientTemp = container.GetBlobClient(tempFileName);
+                            blobClientTemp.DeleteIfExists();
+                        }
+                    }
+                }
+            }
+            return restoreResults.ToString();
         }
     }
 }

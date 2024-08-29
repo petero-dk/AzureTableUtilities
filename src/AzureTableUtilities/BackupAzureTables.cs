@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net.NetworkInformation;
 using System.Text;
 using TheByteStuff.AzureTableUtilities.Exceptions;
 //using AZBlob = Microsoft.Azure.Storage.Blob;
@@ -96,7 +97,7 @@ namespace TheByteStuff.AzureTableUtilities
         /// <returns>A string indicating the name of the blob file created as well as a count of how many files were aged.</returns>
         public string BackupTableToBlob(string TableName, string BlobRoot, string OutFileDirectory, bool Compress = false, bool Validate = false, int RetentionDays = 30, int TimeoutSeconds = 30, List<Filter> filters = default(List<Filter>))
         {
-            string OutFileName ;
+            string OutFileName;
             string OutFileNamePath = "";
 
             if (String.IsNullOrWhiteSpace(TableName))
@@ -121,7 +122,7 @@ namespace TheByteStuff.AzureTableUtilities
 
             try
             {
-                OutFileName = this.BackupTableToFile(TableName, OutFileDirectory, Compress, Validate, TimeoutSeconds, filters); 
+                OutFileName = this.BackupTableToFile(TableName, OutFileDirectory, Compress, Validate, TimeoutSeconds, filters);
                 OutFileNamePath = Path.Combine(OutFileDirectory, OutFileName);
 
 
@@ -144,7 +145,7 @@ namespace TheByteStuff.AzureTableUtilities
                 DateTimeOffset OffsetTimeRetain = System.DateTimeOffset.Now.AddDays(-1 * RetentionDays);
 
 
-                return String.Format("Table '{0}' backed up as '{1}' under blob '{2}\\{3}';", TableName, OutFileName, BlobRoot , directory.ToString());
+                return String.Format("Table '{0}' backed up as '{1}' under blob '{2}\\{3}';", TableName, OutFileName, BlobRoot, directory.ToString());
             }
             catch (ConnectionException cex)
             {
@@ -254,7 +255,7 @@ namespace TheByteStuff.AzureTableUtilities
                     OutFile.Flush();
                     OutFile.Close();
                 }
-                
+
                 if (Validate)
                 {
                     int InRecords = 0;
@@ -281,7 +282,7 @@ namespace TheByteStuff.AzureTableUtilities
 
                         TableSpec footer = System.Text.Json.JsonSerializer.Deserialize<TableSpec>(FooterRec);
 
-                        if ((footer.RecordCount==InRecords) && (footer.TableName.Equals(TableName)))
+                        if ((footer.RecordCount == InRecords) && (footer.TableName.Equals(TableName)))
                         {
                             //Do nothing, in count=out count
                         }
@@ -342,45 +343,47 @@ namespace TheByteStuff.AzureTableUtilities
         /// <summary>
         /// Backup table directly to Blob.
         /// </summary>
-        /// <param name="TableName">Name of Azure Table to backup.</param>
-        /// <param name="BlobRoot">Name to use as blob root folder.</param>
-        /// <param name="Compress">True to compress the file.</param>
+        /// <param name="tableName">Name of Azure Table to backup.</param>
+        /// <param name="blobRoot">Name to use as blob root folder.</param>
+        /// <param name="compress">True to compress the file.</param>
         /// <param name="RetentionDays">Process will age files in blob created more than x days ago.</param>
         /// <param name="TimeoutSeconds">Set timeout for table client.</param>
         /// <param name="filters">A list of Filter objects to be applied to table values extracted.</param>
         /// <returns>A string containing the name of the file created.</returns>
-        public string BackupTableToBlobDirect(string TableName, string BlobRoot, bool Compress = false, int RetentionDays = 30, int TimeoutSeconds = 30, List<Filter> filters = default(List<Filter>))
+        public string BackupTableToBlobDirect(string tableName, string blobRoot, bool compress = false, int RetentionDays = 90, int TimeoutSeconds = 30, List<Filter> filters = default)
         {
-            string OutFileName = "";
+
+            var fileName = tableName + "_Backup_" + System.DateTime.Now.ToString("yyyyMMddHHmmss"); //This is terrible because for multiple tables in a folder, the date will be different for each table
+
+            var result = BackupTableToBlobDirect(tableName, blobRoot, blobRoot.ToLower() + "-table-" + tableName.ToLower(), fileName, compress, filters);
+
+            DateTimeOffset OffsetTimeNow = System.DateTimeOffset.Now;
+            DateTimeOffset OffsetTimeRetain = System.DateTimeOffset.Now.AddDays(-1 * RetentionDays);
+
+            // DO CLEANUP AS BEFORE
+
+            return result;
+        }
+        public string BackupTableToBlobDirect(string tableName, string blobRoot, string folderName, string fileName, bool compress = false, List<Filter> filters = default)
+        {
             int RecordCount = 0;
-            int BackupsAged = 0;
 
-            if (String.IsNullOrWhiteSpace(TableName))
-            {
+            if (string.IsNullOrWhiteSpace(tableName))
                 throw new ParameterSpecException("TableName is missing.");
-            }
 
-            if (String.IsNullOrWhiteSpace(BlobRoot))
-            {
+            if (string.IsNullOrWhiteSpace(blobRoot))
                 throw new ParameterSpecException("BlobRoot is missing.");
-            }
 
             try
             {
-                if (Compress)
-                {
-                    OutFileName = String.Format(TableName + "_Backup_" + System.DateTime.Now.ToString("yyyyMMddHHmmss") + ".txt.7z");                    
-                }
-                else
-                {
-                    OutFileName = String.Format(TableName + "_Backup_" + System.DateTime.Now.ToString("yyyyMMddHHmmss") + ".txt");
-                }
 
-                var container = blobServiceClient.GetBlobContainerClient(BlobRoot);
+                var container = blobServiceClient.GetBlobContainerClient(blobRoot);
                 container.CreateIfNotExists();
-                var directory = container.GetBlobClient(BlobRoot.ToLower() + "-table-" + TableName.ToLower() + "/" + OutFileName);
 
-                var blobClient = container.GetBlobClient(OutFileName);
+
+                var outFileName = $"{(string.IsNullOrWhiteSpace(folderName) ? "" : folderName + "/")}{fileName}.txt{(compress ? ".7z" : "")}";
+
+                var blobClient = container.GetBlobClient(outFileName);
                 var blobUploadOptions = new BlobUploadOptions
                 {
                     TransferOptions = new StorageTransferOptions
@@ -399,14 +402,14 @@ namespace TheByteStuff.AzureTableUtilities
                     var entitiesSerialized = new List<string>();
                     var serializer = new DynamicTableEntityJsonSerializer();
 
-                    var TableSpecStart = new TableSpec(TableName);
+                    var TableSpecStart = new TableSpec(tableName);
                     var NewLineAsBytes = Encoding.UTF8.GetBytes("\n");
 
                     var tempTableSpecStart = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(TableSpecStart));
                     var bs2 = blobClient.OpenWrite(true);
                     Stream bs = bs2;
 
-                    if (Compress)
+                    if (compress)
                     {
                         bs = new GZipStream(bs2, CompressionMode.Compress);
                     }
@@ -420,10 +423,10 @@ namespace TheByteStuff.AzureTableUtilities
                     bs.Write(NewLineAsBytes, 0, NewLineAsBytes.Length);
                     bs.Flush();
 
-                    Pageable<AzureTables.TableEntity> queryResultsFilter = tableServiceClient.GetTableClient(TableName).Query<AzureTables.TableEntity>(filter: Filter.BuildFilterSpec(filters), maxPerPage: 100);
-                    foreach (Page<AzureTables.TableEntity> page in queryResultsFilter.AsPages())
+                    var queryResultsFilter = tableServiceClient.GetTableClient(tableName).Query<AzureTables.TableEntity>(filter: Filter.BuildFilterSpec(filters), maxPerPage: 100);
+                    foreach (var page in queryResultsFilter.AsPages())
                     {
-                        foreach (AzureTables.TableEntity qEntity in page.Values)
+                        foreach (var qEntity in page.Values)
                         {
                             // var tempDTE = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(qEntity));  // Int32 type gets lost in stock serializer
                             var tempDTE = Encoding.UTF8.GetBytes(serializer.Serialize(qEntity));
@@ -433,25 +436,22 @@ namespace TheByteStuff.AzureTableUtilities
                             bs.Flush();
                             RecordCount++;
                         }
-                     }
-                    TableSpec TableSpecEnd = new TableSpec(TableName, RecordCount);
+                    }
+                    var TableSpecEnd = new TableSpec(tableName, RecordCount);
                     var tempTableSpecEnd = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(TableSpecEnd));
                     bs.Write(tempTableSpecEnd, 0, tempTableSpecEnd.Length);
                     bs.Flush();
                     bs.Write(NewLineAsBytes, 0, NewLineAsBytes.Length);
                     bs.Flush();
-                    bs.Close();                    
+                    bs.Close();
                 }
                 catch (Exception ex)
                 {
-                    throw new BackupFailedException(String.Format("Table '{0}' backup failed.", TableName), ex);
+                    throw new BackupFailedException(String.Format("Table '{0}' backup failed.", tableName), ex);
                 }
 
-                DateTimeOffset OffsetTimeNow = System.DateTimeOffset.Now;
-                DateTimeOffset OffsetTimeRetain = System.DateTimeOffset.Now.AddDays(-1 * RetentionDays);
 
-
-                return String.Format("Table '{0}' backed up as '{2}' under blob '{3}\\{4}'; {1} files aged.", TableName, BackupsAged, OutFileName, BlobRoot, directory.ToString());
+                return String.Format("Table '{0}' backed up as '{1}' under blob '{2}'.", tableName, outFileName, blobRoot);
             }
             catch (ConnectionException cex)
             {
@@ -459,7 +459,7 @@ namespace TheByteStuff.AzureTableUtilities
             }
             catch (Exception ex)
             {
-                throw new BackupFailedException(String.Format("Table '{0}' backup failed.", TableName), ex);
+                throw new BackupFailedException(String.Format("Table '{0}' backup failed.", tableName), ex);
             }
             finally
             {
@@ -503,6 +503,38 @@ namespace TheByteStuff.AzureTableUtilities
             catch (Exception ex)
             {
                 throw new BackupFailedException(String.Format("Backup of all tables to blob '{0}' failed.", BlobRoot), ex);
+            }
+        } // BackupAllTablesToBlob
+
+
+
+        public string BackupAllTablesToBlob(string blobRoot, string folderName, bool compress = false, List<Filter> filters = default(List<Filter>))
+        {
+            if (String.IsNullOrWhiteSpace(blobRoot))
+            {
+                throw new ParameterSpecException("BlobRoot is missing.");
+            }
+
+            try
+            {
+                StringBuilder BackupResults = new StringBuilder();
+                List<string> TableNames = Helper.GetTableNames(tableServiceClient);
+                if (TableNames.Count() > 0)
+                {
+                    foreach (string tableName in TableNames)
+                    {
+                        BackupResults.Append(BackupTableToBlobDirect(tableName, blobRoot, folderName, tableName, compress, filters) + "|");
+                    }
+                    return BackupResults.ToString();
+                }
+                else
+                {
+                    return "No Tables found.";
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new BackupFailedException(string.Format("Backup of all tables to blob '{0}' failed.", blobRoot), ex);
             }
         } // BackupAllTablesToBlob
     }
